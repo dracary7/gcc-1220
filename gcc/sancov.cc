@@ -43,7 +43,20 @@ along with GCC; see the file COPYING3.  If not see
 #include "cgraph.h"
 #include "asan.h"
 
+#include <string.h>
+#include <assert.h>
+
 namespace {
+  extern "C"{
+    typedef struct ipt
+    {
+      int capacity;
+      int size;
+      char *func[];
+    }ipt;
+  }
+
+  ipt *ipt_table = NULL;
 
 /* Instrument one comparison operation, which compares lhs and rhs.
    Call the instrumentation function with the comparison operand.
@@ -233,10 +246,66 @@ instrument_switch (gimple_stmt_iterator *gsi, gimple *stmt, function *fun)
   gsi_insert_seq_before (gsi, seq, GSI_SAME_STMT);
 }
 
+#define MAX_FUNCS 0x100
+#define ONCE_FUNCS 0x10
+
+void init_ipt()
+{
+  char *ipt_file = getenv("IPT_FILE");
+  if (ipt_file != NULL)
+  {
+    ipt_table = (ipt*)xmalloc(sizeof(ipt)+ONCE_FUNCS*sizeof(char *));
+    ipt_table->size = 0;
+    ipt_table->capacity = ONCE_FUNCS;
+    FILE *fp = fopen(ipt_file, "r");
+
+    if (fp == NULL ) {
+      fprintf(stderr, "Cannot open $IPT_FILE.\n");
+      assert (false);
+    }
+    char buf[MAX_FUNCS] = {};
+    while (1)
+    {
+      fscanf(fp, "%s\n", buf);
+      if (strlen(buf) == 0)
+        break;
+
+      if (ipt_table->size == ipt_table->capacity) {
+        ipt_table = (ipt*)xrealloc(ipt_table, sizeof(ipt)+(ipt_table->capacity+ONCE_FUNCS)*sizeof(char *));
+        ipt_table->capacity += ONCE_FUNCS;
+      }
+      ipt_table->func[ipt_table->size] = xstrdup(buf);
+      ipt_table->size++;
+      memset(buf, 0, sizeof(buf));
+    }
+  }
+  else{
+    ipt_table = (ipt*)xmalloc(sizeof(ipt));
+    ipt_table->size = 0 ;
+    ipt_table->capacity = 0;
+  }
+  return;
+}
+
+#define SANCOV_FUNCHEADER 0x1
+#define SANCOV_FUNCIPT 0x2
+
 unsigned
 sancov_pass (function *fun)
 {
   initialize_sanitizer_builtins ();
+  const char *func_name = (DECL_NAME (fun->decl)
+  ? IDENTIFIER_POINTER (DECL_NAME (fun->decl))
+  : "<unknown>");
+
+  basic_block first_bb = EDGE_SUCC(ENTRY_BLOCK_PTR_FOR_FN(fun),0)->dest;
+  // fprintf(stderr, "func_name: %s\n", func_name);
+  // fprintf(stderr, "hello word!\n");
+  // fprintf(stderr, "now table->size: %d\n", ipt_table->size);
+  // for(int i=0;i<ipt_table->size;i++)
+  //   fprintf(stderr, "%d.%s\n", i, ipt_table->func[i]);
+  // dump_printf(TDF_ADDRESS, "hello world!\n");
+  // fun->cfg->x_entry_block_ptr
 
   /* Insert callback into beginning of every BB. */
   if (flag_sanitize_coverage & SANITIZE_COV_TRACE_PC)
@@ -249,7 +318,22 @@ sancov_pass (function *fun)
 	  if (gsi_end_p (gsi))
 	    continue;
 	  gimple *stmt = gsi_stmt (gsi);
-	  gimple *gcall = gimple_build_call (fndecl, 0);
+    int flags = 0;
+    if(bb == first_bb){
+      // fprintf(stderr, "fcuntion first_bb\n");
+      flags = flags | SANCOV_FUNCHEADER;
+      // fprintf(stderr, "insert %d\n", flags);
+    }
+    // TODO: maybe too slow
+    for(int i=0; i<ipt_table->size; i++){
+      // fprintf(stderr, "%d.%s\n", i, ipt_table->func[i]);
+      if(!strcmp(func_name, ipt_table->func[i])){
+        flags = flags | SANCOV_FUNCIPT;
+        // fprintf(stderr, "insert %d\n", flags);
+        }
+    }
+    tree param = build_int_cst(integer_type_node, flags);
+	  gimple *gcall = gimple_build_call (fndecl, 1, param);
 	  gimple_set_location (gcall, gimple_location (stmt));
 	  gsi_insert_before (&gsi, gcall, GSI_SAME_STMT);
 	}
@@ -304,7 +388,10 @@ sancov_pass (function *fun)
 template <bool O0> class pass_sancov : public gimple_opt_pass
 {
 public:
-  pass_sancov (gcc::context *ctxt) : gimple_opt_pass (data, ctxt) {}
+  static ipt *ipt_table;
+  pass_sancov (gcc::context *ctxt) : gimple_opt_pass (data, ctxt) {
+    init_ipt();
+  }
 
   static const pass_data data;
   opt_pass *
@@ -350,3 +437,4 @@ make_pass_sancov_O0 (gcc::context *ctxt)
 {
   return new pass_sancov<true> (ctxt);
 }
+
